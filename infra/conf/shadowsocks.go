@@ -1,0 +1,193 @@
+package conf
+
+import (
+	"strings"
+
+	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/common/task"
+	"github.com/xtls/xray-core/proxy/shadowsocks"
+	"google.golang.org/protobuf/proto"
+)
+
+// This fork drops Shadowsocks-2022 together with the sagernet/sing dependencies
+// (they are GPL-3.0-or-later and make the stock binary GPL). Plain Shadowsocks (AEAD)
+// stays. The 2022 ciphers (2022-blake3-*) are recognized only to return a clear error
+// instead of silently building a wrong config.
+func isShadowsocks2022Cipher(c string) bool {
+	return strings.HasPrefix(strings.ToLower(c), "2022-blake3")
+}
+
+func cipherFromString(c string) shadowsocks.CipherType {
+	switch strings.ToLower(c) {
+	case "aes-128-gcm", "aead_aes_128_gcm":
+		return shadowsocks.CipherType_AES_128_GCM
+	case "aes-256-gcm", "aead_aes_256_gcm":
+		return shadowsocks.CipherType_AES_256_GCM
+	case "chacha20-poly1305", "aead_chacha20_poly1305", "chacha20-ietf-poly1305":
+		return shadowsocks.CipherType_CHACHA20_POLY1305
+	case "xchacha20-poly1305", "aead_xchacha20_poly1305", "xchacha20-ietf-poly1305":
+		return shadowsocks.CipherType_XCHACHA20_POLY1305
+	default:
+		return shadowsocks.CipherType_UNKNOWN
+	}
+}
+
+type ShadowsocksUserConfig struct {
+	Cipher   string   `json:"method"`
+	Password string   `json:"password"`
+	Level    byte     `json:"level"`
+	Email    string   `json:"email"`
+	Address  *Address `json:"address"`
+	Port     uint16   `json:"port"`
+}
+
+type ShadowsocksServerConfig struct {
+	Cipher      string                   `json:"method"`
+	Password    string                   `json:"password"`
+	Level       byte                     `json:"level"`
+	Email       string                   `json:"email"`
+	Users       []*ShadowsocksUserConfig `json:"users"`
+	Clients     []*ShadowsocksUserConfig `json:"clients"`
+	NetworkList *NetworkList             `json:"network"`
+}
+
+func (v *ShadowsocksServerConfig) Build() (proto.Message, error) {
+	errors.PrintNonRemovalDeprecatedFeatureWarning("Shadowsocks (with no Forward Secrecy, etc.)", "VLESS Encryption")
+
+	if v.Clients != nil {
+		v.Users = v.Clients
+	}
+
+	if isShadowsocks2022Cipher(v.Cipher) {
+		return nil, errors.New("Shadowsocks 2022 is not supported in this build.")
+	}
+
+	config := new(shadowsocks.ServerConfig)
+	config.Network = v.NetworkList.Build()
+
+	if v.Users != nil {
+		if len(v.Users) > 0 {
+			config.Users = make([]*protocol.User, len(v.Users))
+			processUser := func(idx int) error {
+				user := v.Users[idx]
+				account := &shadowsocks.Account{
+					Password:   user.Password,
+					CipherType: cipherFromString(user.Cipher),
+				}
+				if account.Password == "" {
+					return errors.New("Shadowsocks password is not specified.")
+				}
+				if account.CipherType < shadowsocks.CipherType_AES_128_GCM ||
+					account.CipherType > shadowsocks.CipherType_XCHACHA20_POLY1305 {
+					return errors.New("unsupported cipher method: ", user.Cipher)
+				}
+				config.Users[idx] = &protocol.User{
+					Email:   user.Email,
+					Level:   uint32(user.Level),
+					Account: serial.ToTypedMessage(account),
+				}
+				return nil
+			}
+			if err := task.ParallelForN(len(v.Users), processUser); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		account := &shadowsocks.Account{
+			Password:   v.Password,
+			CipherType: cipherFromString(v.Cipher),
+		}
+		if account.Password == "" {
+			return nil, errors.New("Shadowsocks password is not specified.")
+		}
+		if account.CipherType == shadowsocks.CipherType_UNKNOWN {
+			return nil, errors.New("unknown cipher method: ", v.Cipher)
+		}
+		config.Users = append(config.Users, &protocol.User{
+			Email:   v.Email,
+			Level:   uint32(v.Level),
+			Account: serial.ToTypedMessage(account),
+		})
+	}
+
+	return config, nil
+}
+
+type ShadowsocksServerTarget struct {
+	Address  *Address `json:"address"`
+	Port     uint16   `json:"port"`
+	Level    byte     `json:"level"`
+	Email    string   `json:"email"`
+	Cipher   string   `json:"method"`
+	Password string   `json:"password"`
+}
+
+type ShadowsocksClientConfig struct {
+	Address  *Address                   `json:"address"`
+	Port     uint16                     `json:"port"`
+	Level    byte                       `json:"level"`
+	Email    string                     `json:"email"`
+	Cipher   string                     `json:"method"`
+	Password string                     `json:"password"`
+	Servers  []*ShadowsocksServerTarget `json:"servers"`
+}
+
+func (v *ShadowsocksClientConfig) Build() (proto.Message, error) {
+	errors.PrintNonRemovalDeprecatedFeatureWarning("Shadowsocks (with no Forward Secrecy, etc.)", "VLESS Encryption")
+
+	if v.Address != nil {
+		v.Servers = []*ShadowsocksServerTarget{
+			{
+				Address:  v.Address,
+				Port:     v.Port,
+				Level:    v.Level,
+				Email:    v.Email,
+				Cipher:   v.Cipher,
+				Password: v.Password,
+			},
+		}
+	}
+	if len(v.Servers) != 1 {
+		return nil, errors.New(`Shadowsocks settings: "servers" should have one and only one member. Multiple endpoints in "servers" should use multiple Shadowsocks outbounds and routing balancer instead`)
+	}
+
+	config := new(shadowsocks.ClientConfig)
+	for _, server := range v.Servers {
+		if isShadowsocks2022Cipher(server.Cipher) {
+			return nil, errors.New("Shadowsocks 2022 is not supported in this build.")
+		}
+		if server.Address == nil {
+			return nil, errors.New("Shadowsocks server address is not set.")
+		}
+		if server.Port == 0 {
+			return nil, errors.New("Invalid Shadowsocks port.")
+		}
+		if server.Password == "" {
+			return nil, errors.New("Shadowsocks password is not specified.")
+		}
+		account := &shadowsocks.Account{
+			Password: server.Password,
+		}
+		account.CipherType = cipherFromString(server.Cipher)
+		if account.CipherType == shadowsocks.CipherType_UNKNOWN {
+			return nil, errors.New("unknown cipher method: ", server.Cipher)
+		}
+
+		ss := &protocol.ServerEndpoint{
+			Address: server.Address.Build(),
+			Port:    uint32(server.Port),
+			User: &protocol.User{
+				Level:   uint32(server.Level),
+				Email:   server.Email,
+				Account: serial.ToTypedMessage(account),
+			},
+		}
+
+		config.Server = ss
+		break
+	}
+
+	return config, nil
+}
