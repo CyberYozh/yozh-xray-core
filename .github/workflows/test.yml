@@ -1,0 +1,100 @@
+name: Tests and Checkings
+
+on:
+  push:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  check-proto:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v7
+      - name: Check Proto Version Header
+        run: |
+          head -n 4 core/config.pb.go > ref.txt
+          find . -name "*.pb.go" ! -name "*_grpc.pb.go" -print0 | while IFS= read -r -d '' file; do
+            if ! cmp -s ref.txt <(head -n 4 "$file"); then
+              echo "Error: Header mismatch in $file"
+              head -n 4 "$file"
+              exit 1
+            fi
+          done
+
+  check-format:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: false
+      - name: Check Format
+        run: |
+          # gofumpt is pinned, not @latest: v0.12.0 reindents the multi-value return
+          # literal in transport/pipe/pipe.go, an upstream file that stays as it is.
+          # Format locally with the same version: go install mvdan.cc/gofumpt@v0.11.0
+          go install -v mvdan.cc/gofumpt@v0.11.0
+          go run ./infra/vformat/main.go -mode check -pwd ./
+
+  test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name
+    permissions:
+      contents: read
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      # The geodata tests read resources/geoip.dat and resources/geosite.dat; fetch them and check the published SHA-256 sums.
+      - name: Fetch Geodata
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          # The CDN caches every URL for 300 s on its own, so right after the daily update a new .dat can
+          # come with the old .sha256sum. The file and its sum are therefore fetched and checked as a
+          # pair, and the whole pair is tried again a little later before the step fails.
+          fetch_geodata() {
+            local name="$1"
+            local url="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/${name}.dat"
+            local want got
+            echo "Downloading ${url}..."
+            curl -fsSL --retry 3 "${url}" -o "resources/${name}.dat" || return 1
+            echo "Verifying the SHA-256 sum of ${name}.dat..."
+            want="$(curl -fsSL --retry 3 "${url}.sha256sum" | awk '{print $1}')" || return 1
+            got="$(sha256sum -b "resources/${name}.dat" | awk '{print $1}')" || return 1
+            if [ -z "${want}" ] || [ "${want}" != "${got}" ]; then
+              echo "The SHA-256 sum of ${name}.dat does not match the published one: expected '${want}', got '${got}'."
+              return 1
+            fi
+          }
+          mkdir -p resources
+          for NAME in geoip geosite; do
+            for ATTEMPT in 1 2 3; do
+              fetch_geodata "${NAME}" && break
+              if [ "${ATTEMPT}" -eq 3 ]; then
+                echo "No verified ${NAME}.dat after 3 attempts."
+                exit 1
+              fi
+              echo "Attempt ${ATTEMPT} of 3 for ${NAME}.dat failed; trying again in 30 s."
+              sleep 30
+            done
+          done
+      - name: Test
+        run: go test -timeout 1h -v ./...
